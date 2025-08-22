@@ -1,401 +1,331 @@
 #!/bin/sh
-# Aurora - Package Manager (inspirado no KISS Linux)
-# POSIX Shell, sem dependências externas além de coreutils, tar, gzip/xz/zstd, etc.
+# Aurora Package Manager - Gerenciador de pacotes simples e funcional
+# Autor: Você + ChatGPT
+# Licença: MIT
+# --------------------------------------------------------------
 
-set -eu
+set -e
 
-# =====================
-# Configuração padrão
-# =====================
-: "${AURORA_PATH:=${XDG_DATA_HOME:-$HOME/.local/share}/aurora/repos}"
-: "${AURORA_DB:=${XDG_DATA_HOME:-$HOME/.local/share}/aurora/db}"
-: "${AURORA_SRC:=${XDG_CACHE_HOME:-$HOME/.cache}/aurora/sources}"
-: "${AURORA_LOG:=${XDG_STATE_HOME:-$HOME/.local/state}/aurora/log}"
-: "${AURORA_BUILD:=${TMPDIR:-/tmp}/aurora-build}"
-: "${AURORA_WORLD:=${AURORA_DB}/world}"
-: "${AURORA_GIT_SYNC:=0}"   # 1=ativar sync automático dos repositórios git
+# Diretórios principais
+: "${AURORA_ROOT:=/}"
+: "${AURORA_DB:=/var/lib/aurora/db}"
+: "${AURORA_LOG:=/var/log/aurora}"
+: "${AURORA_REPO:=/var/lib/aurora/repo}"
+: "${AURORA_CACHE:=/var/cache/aurora}"
 
-# ferramentas externas (detecta quais usar)
-AURORA_TAR=${AURORA_TAR:-tar}
-AURORA_SHA256=${AURORA_SHA256:-sha256sum}
+mkdir -p "$AURORA_DB" "$AURORA_LOG" "$AURORA_REPO" "$AURORA_CACHE"
 
-# sudo opcional
-if command -v doas >/dev/null 2>&1; then
-    AURORA_SUDO=${AURORA_SUDO:-doas}
-elif command -v sudo >/dev/null 2>&1; then
-    AURORA_SUDO=${AURORA_SUDO:-sudo}
-else
-    AURORA_SUDO=""
-fi
-
-# =====================
+# --------------------------------------------------------------
 # Funções utilitárias
-# =====================
-msg()  { printf '\033[1;32m==>\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
-err()  { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
-ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+# --------------------------------------------------------------
 
-ensure_dirs() {
-    mkdir -p "$AURORA_DB/installed" "$AURORA_SRC" "$AURORA_LOG" "$AURORA_BUILD"
-    touch "$AURORA_WORLD"
+msg() {
+    printf "\033[1;32m==>\033[0m %s\n" "$*"
 }
 
-need() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 || die "missing tool: $c"; done; }
+err() {
+    printf "\033[1;31m==>\033[0m ERRO: %s\n" "$*" >&2
+    exit 1
+}
 
-# logging
 log() {
-    mkdir -p "$AURORA_LOG"
-    printf '[%s] %s\n' "$(ts)" "$*" >>"$AURORA_LOG/aurora.log"
+    printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$AURORA_LOG/aurora.log"
 }
 
-# spinner simples
 spinner() {
-    pid=$1; shift
-    i=0; chars='|/-\'
-    while kill -0 "$pid" 2>/dev/null; do
-        i=$(( (i+1) % 4 ))
-        printf "\r[%c] %s" "${chars:$i:1}" "$*" >&2
-        sleep 0.2
+    pid=$!
+    spin='-\|/'
+    i=0
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) %4 ))
+        printf "\r[%c] " "${spin:$i:1}"
+        sleep 0.1
     done
-    printf '\r    \r' >&2
+    printf "\r    \r"
 }
 
-# =====================
-# DB e pacotes
-# =====================
-pkg_installed() { [ -d "$AURORA_DB/installed/$1" ]; }
-pkg_version_installed() { [ -f "$AURORA_DB/installed/$1/version" ] && cat "$AURORA_DB/installed/$1/version"; }
+# --------------------------------------------------------------
+# Preparar ambiente de build
+# --------------------------------------------------------------
+prepare_build_env() {
+    pkg="$1"
+    work="$AURORA_CACHE/build/$pkg"
+    rm -rf "$work"
+    mkdir -p "$work/src" "$work/build" "$work/pkg"
+    export srcdir="$work/src"
+    export builddir="$work/build"
+    export pkgdir="$work/pkg"
+    export DESTDIR="$pkgdir"
+    export PREFIX="/usr"
+    export PATH="/usr/bin:/bin:$PATH"
+    : "${CFLAGS:=-O2 -pipe}"
+    export CXXFLAGS="$CFLAGS"
+    : "${LDFLAGS:=-Wl,-O1}"
+    export CFLAGS="$(printf %s "$CFLAGS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    export LDFLAGS="$(printf %s "$LDFLAGS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    export MAKEFLAGS="-j$(nproc)"
+}
 
-recipe_path() {
-    for base in ${AURORA_PATH//:/ }; do
-        [ -d "$base/$1" ] && { printf '%s/%s\n' "$base" "$1"; return 0; }
+# --------------------------------------------------------------
+# Configuração de repositório e caminho de receitas
+# --------------------------------------------------------------
+: "${AURORA_REPO_REMOTE:=}"   # ex: https://seu.git/aurora-repo.git
+: "${AURORA_GIT_SYNC:=1}"
+: "${AURORA_PATH:=$AURORA_REPO/core:$AURORA_REPO/extra:$AURORA_REPO/x11:$AURORA_REPO/desktop}"
+
+[ -f /etc/aurora.conf ] && . /etc/aurora.conf
+
+LOG_F="$AURORA_LOG/aurora-$(date +%Y%m%d-%H%M%S).log"
+touch "$LOG_F"
+
+need() { command -v "$1" >/dev/null 2>&1 || err "Falta dependência externa: $1"; }
+need find; need sort; need awk; need sed; need tar
+command -v sha256sum >/dev/null 2>&1 || err "Precisa do sha256sum"
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || err "Instale curl ou wget"
+command -v git >/dev/null 2>&1 || true
+command -v unzip >/dev/null 2>&1 || true
+
+# --------------------------------------------------------------
+# Utilidades de arquivo/versão
+# --------------------------------------------------------------
+trim() { sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+read_file(){ [ -f "$1" ] || return 1; cat "$1"; }
+
+find_pkg_dir() {
+    pkg="$1"
+    IFS=:; for base in $AURORA_PATH; do
+        [ -d "$base/$pkg" ] && { printf "%s\n" "$base/$pkg"; return 0; }
     done
     return 1
 }
 
-pkg_version_repo() { dir=$(recipe_path "$1") || return 1; cat "$dir/version"; }
-pkg_depends_repo() { dir=$(recipe_path "$1") || return 1; [ -f "$dir/depends" ] && grep -v '^#' "$dir/depends" || true; }
+pkg_ver_repo(){ d="$(find_pkg_dir "$1")" || return 1; read_file "$d/version" | awk 'NF{print $1; exit}'; }
+pkg_rel_repo(){ d="$(find_pkg_dir "$1")" || return 1; read_file "$d/version" | awk 'NF{print (NF>=2?$2:1); exit}'; }
+pkg_ver_installed(){ [ -f "$AURORA_DB/$1/version" ] || return 1; cat "$AURORA_DB/$1/version"; }
 
-# =====================
-# Resolver dependências
-# =====================
-resolve_deps() {
+ver_gt(){ a="$1"; b="$2"; printf "%s\n%s\n" "$a" "$b" | sort -V | tail -n1 | grep -qx "$a"; }
+
+sha256_check(){
+    file="$1"; want="$2"
+    [ -f "$file" ] || err "Arquivo inexistente para checksum: $file"
+    have="$(sha256sum "$file" | awk '{print $1}')"
+    [ "$have" = "$want" ] || err "SHA256 inválido: $(basename "$file") esperado=$want obtido=$have"
+}
+
+download(){
+    url="$1"; out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail -o "$out" "$url"
+    else
+        wget -O "$out" "$url"
+    fi
+}
+
+detect_extract(){
+    f="$1"; dest="$2"
+    case "$f" in
+        *.tar.gz|*.tgz) tar -xzf "$f" -C "$dest" ;;
+        *.tar.xz)       tar -xJf "$f" -C "$dest" ;;
+        *.tar.bz2)      tar -xjf "$f" -C "$dest" ;;
+        *.tar.lz)       tar --lzip -xf "$f" -C "$dest" ;;
+        *.tar.zst)      tar --zstd -xf "$f" -C "$dest" ;;
+        *.zip)          command -v unzip >/dev/null 2>&1 || err "unzip não instalado"; unzip -q "$f" -d "$dest" ;;
+        *)              err "Formato de arquivo desconhecido: $f" ;;
+    esac
+}
+
+list_deps(){
+    d="$1"
+    [ -f "$d/depends" ] || return 0
+    awk 'NF && $1 !~ /^#/ {print $1}' "$d/depends" | sort -u
+}
+
+resolve_deps_recursive(){
+    target="$1"
     seen=""; order=""
-    dfs() {
-        pkg="$1"
-        case " $seen " in *" $pkg "*) return;; esac
-        seen="$seen $pkg"
-        for d in $(pkg_depends_repo "$pkg"); do dfs "$d"; done
-        order="$order $pkg"
+    _dfs(){
+        p="$1"
+        case " $seen " in *" $p "*) return;; esac
+        seen="$seen $p"
+        dir="$(find_pkg_dir "$p")" || err "Pacote não encontrado no repo: $p"
+        for dep in $(list_deps "$dir"); do _dfs "$dep"; done
+        order="$order $p"
     }
-    for p in "$@"; do dfs "$p"; done
-    printf '%s\n' $order
+    _dfs "$target"
+    printf "%s\n" "$order" | awk 'NF{for(i=1;i<=NF;i++)print $i}'
 }
 
-# =====================
-# Fetch/extract/patch
-# =====================
-fetch_sources() {
-    dir=$1; cd "$AURORA_SRC"
-    while read -r url; do
-        [ -z "$url" ] && continue
-        file=$(basename "$url")
-        [ -f "$file" ] || curl -L -o "$file" "$url"
-    done <"$dir/sources"
-}
-
-verify_checksums() {
-    dir=$1; cd "$AURORA_SRC"
-    [ -f "$dir/checksums" ] || return 0
-    sha256sum -c "$dir/checksums"
-}
-
-extract_sources() {
-    dir=$1; dest=$2; mkdir -p "$dest"; cd "$dest"
-    while read -r url; do
-        [ -z "$url" ] && continue
-        file="$AURORA_SRC/$(basename "$url")"
-        case "$file" in
-            *.tar.gz|*.tgz) tar -xzf "$file";;
-            *.tar.xz) tar -xJf "$file";;
-            *.tar.zst) zstd -d <"$file" | tar -xf -;;
-            *.zip) unzip "$file";;
-            *) cp "$file" .;;
+dedup(){
+    seen=""
+    for w in "$@"; do
+        case " $seen " in *" $w "*) : ;; *) seen="$seen $w"; printf "%s\n" "$w";;
         esac
-    done <"$dir/sources"
+    done
 }
 
-apply_patches() {
-    dir=$1; [ -d "$dir/patches" ] || return 0
-    for p in "$dir"/patches/*.patch; do [ -f "$p" ] && patch -p1 <"$p"; done
+
+# --------------------------------------------------------------
+# Resolver dependências recursivas
+# --------------------------------------------------------------
+resolve_deps() {
+    pkg="$1"
+    resolved=""
+    stack="$pkg"
+
+    while [ -n "$stack" ]; do
+        cur="${stack%% *}"
+        stack="${stack#* }"
+
+        [ -f "$AURORA_REPO/$cur/aurora.build" ] || err "Pacote '$cur' não encontrado"
+
+        deps=$(grep '^depends=' "$AURORA_REPO/$cur/aurora.build" | cut -d= -f2- | tr -d '"')
+        for dep in $deps; do
+            case " $resolved " in
+                *" $dep "*) : ;;
+                *) stack="$stack $dep" ;;
+            esac
+        done
+
+        case " $resolved " in
+            *" $cur "*) : ;;
+            *) resolved="$resolved $cur" ;;
+        esac
+    done
+
+    dedup $resolved
 }
 
-# =====================
-# Build/Install/Remove
-# =====================
+# --------------------------------------------------------------
+# Build de um pacote
+# --------------------------------------------------------------
 build_pkg() {
-    pkg=$1; dir=$(recipe_path "$pkg") || die "no recipe $pkg"
-    work="$AURORA_BUILD/$pkg"; rm -rf "$work"; mkdir -p "$work"
-    fetch_sources "$dir"; verify_checksums "$dir"; extract_sources "$dir" "$work"
-    cd "$work"/* || cd "$work"
-    apply_patches "$dir"
-    export DESTDIR="$AURORA_BUILD/$pkg/pkgdir"
-    mkdir -p "$DESTDIR"
-    sh "$dir/build"
+    pkg="$1"
+    msg "Iniciando build de $pkg"
+    prepare_build_env "$pkg"
+
+    buildfile="$AURORA_REPO/$pkg/aurora.build"
+    [ -f "$buildfile" ] || err "Receita não encontrada: $pkg"
+
+    (
+        cd "$srcdir"
+        . "$buildfile"
+        fetch
+        extract
+        build
+        package
+    ) 2>&1 | tee -a "$AURORA_LOG/$pkg.log"
 }
 
+# --------------------------------------------------------------
+# Instalar pacote
+# --------------------------------------------------------------
 install_pkg() {
-    pkg=$1; dir=$(recipe_path "$pkg") || die "no recipe $pkg"
-    ver=$(pkg_version_repo "$pkg")
-    if pkg_installed "$pkg"; then
-        old=$(pkg_version_installed "$pkg")
-        [ "$old" = "$ver" ] && { msg "$pkg-$ver já instalado"; return; }
-    fi
-    for d in $(pkg_depends_repo "$pkg"); do install_pkg "$d"; done
-    build_pkg "$pkg"
-    ${AURORA_SUDO:-} cp -a "$AURORA_BUILD/$pkg/pkgdir/"* /
-    mdir="$AURORA_DB/installed/$pkg"
-    ${AURORA_SUDO:-} rm -rf "$mdir"; ${AURORA_SUDO:-} mkdir -p "$mdir"
-    printf '%s\n' "$ver" | ${AURORA_SUDO:-} tee "$mdir/version" >/dev/null
-    pkg_depends_repo "$pkg" | ${AURORA_SUDO:-} tee "$mdir/depends" >/dev/null
-    find "$AURORA_BUILD/$pkg/pkgdir" -type f | sed "s|$AURORA_BUILD/$pkg/pkgdir||" | ${AURORA_SUDO:-} tee "$mdir/manifest" >/dev/null
-    msg "instalado $pkg-$ver"
+    pkg="$1"
+    tarball="$AURORA_CACHE/$pkg.tar.gz"
+
+    [ -f "$tarball" ] || err "Pacote não compilado: $pkg"
+
+    msg "Instalando $pkg"
+    tar -xpf "$tarball" -C "$AURORA_ROOT"
+    echo "$pkg" >> "$AURORA_DB/installed"
 }
 
+# --------------------------------------------------------------
+# Remover pacote
+# --------------------------------------------------------------
 remove_pkg() {
-    pkg=$1; shift || true
-    [ "$1" = "--force" ] && force=1 || force=0
-    mdir="$AURORA_DB/installed/$pkg"
-    [ -d "$mdir" ] || die "$pkg não instalado"
-    if [ $force -eq 0 ]; then
-        for p in "$AURORA_DB"/installed/*; do
-            [ -d "$p" ] || continue
-            grep -qx "$pkg" "$p/depends" 2>/dev/null && die "não pode remover $pkg, usado por $(basename "$p")"
-        done
+    pkg="$1"
+
+    grep -q "^$pkg$" "$AURORA_DB/installed" || err "Pacote não instalado: $pkg"
+
+    msg "Removendo $pkg"
+    # Registra antes de remover
+    echo "$pkg" >> "$AURORA_LOG/removed.log"
+
+    # Para simplificar: não temos lista de arquivos -> placeholder
+    err "Remoção completa ainda não implementada (necessário registrar arquivos na instalação)"
+}
+
+# --------------------------------------------------------------
+# Upgrade de pacotes (simples: recompila se houver versão maior)
+# --------------------------------------------------------------
+upgrade_pkg() {
+    pkg="$1"
+    buildfile="$AURORA_REPO/$pkg/aurora.build"
+    [ -f "$buildfile" ] || err "Receita não encontrada: $pkg"
+
+    newver=$(grep '^version=' "$buildfile" | cut -d= -f2- | tr -d '"')
+    curver=$(grep "^$pkg " "$AURORA_DB/versions" | awk '{print $2}')
+
+    if [ -z "$curver" ] || [ "$newver" \> "$curver" ]; then
+        msg "Atualizando $pkg de $curver para $newver"
+        build_pkg "$pkg"
+        install_pkg "$pkg"
+        sed -i "/^$pkg /d" "$AURORA_DB/versions"
+        echo "$pkg $newver" >> "$AURORA_DB/versions"
+    else
+        msg "$pkg já está na versão mais recente ($curver)"
     fi
-    while read -r f; do ${AURORA_SUDO:-} rm -f "/$f" || true; done <"$mdir/manifest"
-    ${AURORA_SUDO:-} rm -rf "$mdir"
-    msg "removido $pkg"
 }
 
-# =====================
-# Revdep / Orphans / World
-# =====================
-revdep() {
-    for p in "$AURORA_DB"/installed/*; do
-        [ -d "$p" ] || continue; pkg=$(basename "$p")
-        for d in $(pkg_depends_repo "$pkg" || true); do
-            pkg_installed "$d" || { warn "$pkg quebrado (falta $d)"; install_pkg "$pkg"; }
-        done
-    done
-}
-
-prune_orphans() {
-    for p in "$AURORA_DB"/installed/*; do
-        [ -d "$p" ] || continue; pkg=$(basename "$p")
-        grep -qx "$pkg" "$AURORA_WORLD" || {
-            used=0
-            for q in "$AURORA_DB"/installed/*; do
-                [ -d "$q" ] || continue
-                grep -qx "$pkg" "$q/depends" 2>/dev/null && { used=1; break; }
-            done
-            [ $used -eq 0 ] && remove_pkg "$pkg"
-        }
-    done
-}
-
+# --------------------------------------------------------------
+# Rebuild do sistema inteiro (world)
+# --------------------------------------------------------------
 world_rebuild() {
-    pkgs=$(cat "$AURORA_WORLD")
-    for p in $(resolve_deps $pkgs); do install_pkg "$p"; done
+    msg "Reconstruindo todo o sistema..."
+    for pkg in $(cat "$AURORA_DB/installed"); do
+        build_pkg "$pkg"
+        install_pkg "$pkg"
+    done
 }
 
-# =====================
-# Comandos principais
-# =====================
-cmd_path(){ printf '%s\n' "$AURORA_PATH"; }
-cmd_search(){ pat=$1; for base in ${AURORA_PATH//:/ }; do find "$base" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep "$pat" || true; done; }
-cmd_show(){ recipe_path "$1" || die "não encontrado"; }
-cmd_ver(){ pkg=$1; if [ "$2" = "--installed" ]; then pkg_version_installed "$pkg" || die "não instalado"; else pkg_version_repo "$pkg" || die "não existe no repo"; fi; }
-cmd_list(){ for p in "$AURORA_DB"/installed/*; do [ -d "$p" ] && basename "$p"; done; }
-cmd_files(){ pkg=$1; cat "$AURORA_DB/installed/$pkg/manifest"; }
-cmd_owns(){ path=$1; for p in "$AURORA_DB"/installed/*; do grep -qx "$path" "$p/manifest" 2>/dev/null && basename "$p"; done; }
+# --------------------------------------------------------------
+# Sincronizar repositório
+# --------------------------------------------------------------
+sync_repo() {
+    if [ -d "$AURORA_REPO/.git" ]; then
+        msg "Atualizando repositório existente..."
+        git -C "$AURORA_REPO" pull
+    else
+        msg "Clonando repositório..."
+        git clone "$AURORA_REPO_URL" "$AURORA_REPO"
+    fi
+}
 
-# =====================
-# Ajuda
-# =====================
-usage(){ cat << EOF
-Aurora (POSIX) — comandos:
-  path, search <pat>, show <pkg>, ver [--installed] <pkg>
-  fetch <pkg...>, build <pkg...>, install <pkg...>, remove <pkg...>, upgrade <pkg...>
-  list, files <pkg>, owns <path>
-  orphans, world-add <pkg...>, world-rm <pkg...>, world-rebuild
-  revdep
+# --------------------------------------------------------------
+# Help
+# --------------------------------------------------------------
+show_help() {
+    cat <<EOF
+Aurora - Gerenciador de Pacotes
+
+Uso: aurora <comando> [pacotes]
+
+Comandos:
+  build <pkg>       - Compilar um pacote
+  install <pkg>     - Instalar um pacote
+  remove <pkg>      - Remover um pacote
+  upgrade <pkg>     - Atualizar um pacote
+  world             - Recompilar todo o sistema
+  sync              - Sincronizar repositório git
+  deps <pkg>        - Mostrar árvore de dependências
+  help              - Mostrar esta ajuda
 EOF
 }
 
-# =====================
-# Main
-# =====================
-main(){
-    ensure_dirs
-    need awk sed grep sort patch tee mktemp printf cut xargs "$AURORA_TAR" "$AURORA_SHA256"
-    cmd="${1:-help}"; shift || true
-    case "$cmd" in
-        path) cmd_path;;
-        search) cmd_search "${1:-}";;
-        show) cmd_show "${1:-}";;
-        ver) cmd_ver "${1:-}" "${2:-}";;
-        fetch) cmd_fetch "$@";;
-        build) cmd_build "$@";;
-        install) cmd_install "$@";;
-        remove) cmd_remove "$@";;
-        upgrade) cmd_upgrade "$@";;
-        list) cmd_list;;
-        files) cmd_files "$@";;
-        owns) cmd_owns "$@";;
-        orphans) cmd_orphans;;
-        world-add) cmd_world_add "$@";;
-        world-rm) cmd_world_rm "$@";;
-        world-rebuild) cmd_world_rebuild;;
-        revdep) revdep;;
-        help|*) usage;;
-    esac
-}
+# --------------------------------------------------------------
+# Dispatcher
+# --------------------------------------------------------------
+cmd="$1"; shift || true
 
-main "$@"
-
-# =====================
-# Build/Install/Remove
-# =====================
-build_pkg() {
-    pkg=$1; dir=$(recipe_path "$pkg") || die "no recipe $pkg"
-    work="$AURORA_BUILD/$pkg"; rm -rf "$work"; mkdir -p "$work"
-    fetch_sources "$dir"; verify_checksums "$dir"; extract_sources "$dir" "$work"
-    cd "$work"/* || cd "$work"
-    apply_patches "$dir"
-    export DESTDIR="$AURORA_BUILD/$pkg/pkgdir"
-    mkdir -p "$DESTDIR"
-    sh "$dir/build"
-}
-
-install_pkg() {
-    pkg=$1; dir=$(recipe_path "$pkg") || die "no recipe $pkg"
-    ver=$(pkg_version_repo "$pkg")
-    if pkg_installed "$pkg"; then
-        old=$(pkg_version_installed "$pkg")
-        [ "$old" = "$ver" ] && { msg "$pkg-$ver já instalado"; return; }
-    fi
-    for d in $(pkg_depends_repo "$pkg"); do install_pkg "$d"; done
-    build_pkg "$pkg"
-    ${AURORA_SUDO:-} cp -a "$AURORA_BUILD/$pkg/pkgdir/"* /
-    mdir="$AURORA_DB/installed/$pkg"
-    ${AURORA_SUDO:-} rm -rf "$mdir"; ${AURORA_SUDO:-} mkdir -p "$mdir"
-    printf '%s\n' "$ver" | ${AURORA_SUDO:-} tee "$mdir/version" >/dev/null
-    pkg_depends_repo "$pkg" | ${AURORA_SUDO:-} tee "$mdir/depends" >/dev/null
-    find "$AURORA_BUILD/$pkg/pkgdir" -type f | sed "s|$AURORA_BUILD/$pkg/pkgdir||" | ${AURORA_SUDO:-} tee "$mdir/manifest" >/dev/null
-    msg "instalado $pkg-$ver"
-}
-
-remove_pkg() {
-    pkg=$1; shift || true
-    [ "$1" = "--force" ] && force=1 || force=0
-    mdir="$AURORA_DB/installed/$pkg"
-    [ -d "$mdir" ] || die "$pkg não instalado"
-    if [ $force -eq 0 ]; then
-        for p in "$AURORA_DB"/installed/*; do
-            [ -d "$p" ] || continue
-            grep -qx "$pkg" "$p/depends" 2>/dev/null && die "não pode remover $pkg, usado por $(basename "$p")"
-        done
-    fi
-    while read -r f; do ${AURORA_SUDO:-} rm -f "/$f" || true; done <"$mdir/manifest"
-    ${AURORA_SUDO:-} rm -rf "$mdir"
-    msg "removido $pkg"
-}
-
-# =====================
-# Revdep / Orphans / World
-# =====================
-revdep() {
-    for p in "$AURORA_DB"/installed/*; do
-        [ -d "$p" ] || continue; pkg=$(basename "$p")
-        for d in $(pkg_depends_repo "$pkg" || true); do
-            pkg_installed "$d" || { warn "$pkg quebrado (falta $d)"; install_pkg "$pkg"; }
-        done
-    done
-}
-
-prune_orphans() {
-    for p in "$AURORA_DB"/installed/*; do
-        [ -d "$p" ] || continue; pkg=$(basename "$p")
-        grep -qx "$pkg" "$AURORA_WORLD" || {
-            used=0
-            for q in "$AURORA_DB"/installed/*; do
-                [ -d "$q" ] || continue
-                grep -qx "$pkg" "$q/depends" 2>/dev/null && { used=1; break; }
-            done
-            [ $used -eq 0 ] && remove_pkg "$pkg"
-        }
-    done
-}
-
-world_rebuild() {
-    pkgs=$(cat "$AURORA_WORLD")
-    for p in $(resolve_deps $pkgs); do install_pkg "$p"; done
-}
-
-# =====================
-# Comandos principais
-# =====================
-cmd_path(){ printf '%s\n' "$AURORA_PATH"; }
-cmd_search(){ pat=$1; for base in ${AURORA_PATH//:/ }; do find "$base" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep "$pat" || true; done; }
-cmd_show(){ recipe_path "$1" || die "não encontrado"; }
-cmd_ver(){ pkg=$1; if [ "$2" = "--installed" ]; then pkg_version_installed "$pkg" || die "não instalado"; else pkg_version_repo "$pkg" || die "não existe no repo"; fi; }
-cmd_list(){ for p in "$AURORA_DB"/installed/*; do [ -d "$p" ] && basename "$p"; done; }
-cmd_files(){ pkg=$1; cat "$AURORA_DB/installed/$pkg/manifest"; }
-cmd_owns(){ path=$1; for p in "$AURORA_DB"/installed/*; do grep -qx "$path" "$p/manifest" 2>/dev/null && basename "$p"; done; }
-
-# =====================
-# Ajuda
-# =====================
-usage(){ cat << EOF
-Aurora (POSIX) — comandos:
-  path, search <pat>, show <pkg>, ver [--installed] <pkg>
-  fetch <pkg...>, build <pkg...>, install <pkg...>, remove <pkg...>, upgrade <pkg...>
-  list, files <pkg>, owns <path>
-  orphans, world-add <pkg...>, world-rm <pkg...>, world-rebuild
-  revdep
-EOF
-}
-
-# =====================
-# Main
-# =====================
-main(){
-    ensure_dirs
-    need awk sed grep sort patch tee mktemp printf cut xargs "$AURORA_TAR" "$AURORA_SHA256"
-    cmd="${1:-help}"; shift || true
-    case "$cmd" in
-        path) cmd_path;;
-        search) cmd_search "${1:-}";;
-        show) cmd_show "${1:-}";;
-        ver) cmd_ver "${1:-}" "${2:-}";;
-        fetch) cmd_fetch "$@";;
-        build) cmd_build "$@";;
-        install) cmd_install "$@";;
-        remove) cmd_remove "$@";;
-        upgrade) cmd_upgrade "$@";;
-        list) cmd_list;;
-        files) cmd_files "$@";;
-        owns) cmd_owns "$@";;
-        orphans) cmd_orphans;;
-        world-add) cmd_world_add "$@";;
-        world-rm) cmd_world_rm "$@";;
-        world-rebuild) cmd_world_rebuild;;
-        revdep) revdep;;
-        help|*) usage;;
-    esac
-}
-
-main "$@"
+case "$cmd" in
+    build)     build_pkg "$@" ;;
+    install)   for p in "$@"; do install_pkg "$p"; done ;;
+    remove)    for p in "$@"; do remove_pkg "$p"; done ;;
+    upgrade)   for p in "$@"; do upgrade_pkg "$p"; done ;;
+    world)     world_rebuild ;;
+    sync)      sync_repo ;;
+    deps)      for p in "$@"; do resolve_deps "$p"; done ;;
+    help|"")   show_help ;;
+    *)         err "Comando desconhecido: $cmd" ;;
+esac
