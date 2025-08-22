@@ -1,120 +1,95 @@
-#!/bin/sh -e
-#
-# Aurora bootstrap script
-# Cria diretórios, baixa o gerenciador, configura e instala modelo de pacote
-#
+#!/bin/sh
+# Aurora Bootstrap Installer
+# Cria toda a estrutura de diretórios e baixa o Aurora + repositório de pacotes
 
-# === Configurações ===
-AURORA_REPO_GIT="https://seu-git/aurora.git"   # <<<<< troque pelo seu repositório
-AURORA_PREFIX="/usr"
-AURORA_ETC="/etc/aurora.conf"
-AURORA_DB="/var/db/aurora"
+set -e
+
+# =========================
+# CONFIGURAÇÃO
+# =========================
+AURORA_PREFIX="/usr/local/bin"
+AURORA_ETC="/etc"
+AURORA_VAR="/var/db/aurora"
 AURORA_CACHE="/var/cache/aurora"
 AURORA_LOG="/var/log/aurora"
-AURORA_TMP="/var/tmp/aurora"
-AURORA_REPO="$AURORA_DB/repo/core"
 
-echo "[Aurora bootstrap] Iniciando..."
+# Caminho do repositório git remoto (ajuste para o seu)
+AURORA_REPO_REMOTE="git@github.com:seu-usuario/aurora-repo.git"
 
-# === Diretórios ===
-echo "[Aurora bootstrap] Criando diretórios..."
-mkdir -p "$AURORA_DB/db" \
-         "$AURORA_CACHE" \
-         "$AURORA_LOG" \
-         "$AURORA_TMP" \
-         "$AURORA_REPO"
+# =========================
+# CRIAÇÃO DE DIRETÓRIOS
+# =========================
+echo "[+] Criando diretórios principais..."
+mkdir -p "$AURORA_PREFIX"
+mkdir -p "$AURORA_ETC"
+mkdir -p "$AURORA_VAR"
+mkdir -p "$AURORA_CACHE"
+mkdir -p "$AURORA_LOG"
 
-# === Baixar aurora.sh do seu Git ===
-echo "[Aurora bootstrap] Clonando Aurora..."
-tmpdir=$(mktemp -d)
-git clone "$AURORA_REPO_GIT" "$tmpdir/aurora"
+# Diretórios internos
+mkdir -p "$AURORA_VAR/db"
+mkdir -p "$AURORA_VAR/repo"
 
-echo "[Aurora bootstrap] Instalando em $AURORA_PREFIX/bin/aurora"
-install -Dm755 "$tmpdir/aurora/aurora.sh" "$AURORA_PREFIX/bin/aurora"
-rm -rf "$tmpdir"
+# =========================
+# BAIXAR AURORA DO GIT
+# =========================
+echo "[+] Baixando Aurora package manager..."
+if [ ! -d "$AURORA_VAR/aurora" ]; then
+    git clone https://github.com/seu-usuario/aurora.git "$AURORA_VAR/aurora"
+else
+    echo "[=] Aurora já existe em $AURORA_VAR/aurora, atualizando..."
+    git -C "$AURORA_VAR/aurora" pull
+fi
 
-# === Configuração global ===
-echo "[Aurora bootstrap] Criando $AURORA_ETC..."
-cat > "$AURORA_ETC" <<EOF
-# Aurora config
-export AURORA_PATH="$AURORA_REPO"
+# Instala aurora.sh no PATH
+install -m 755 "$AURORA_VAR/aurora/aurora.sh" "$AURORA_PREFIX/aurora"
+
+# =========================
+# CLONAR O REPOSITÓRIO DE PACOTES
+# =========================
+echo "[+] Clonando repositório de pacotes..."
+if [ ! -d "$AURORA_VAR/repo/.git" ]; then
+    git clone "$AURORA_REPO_REMOTE" "$AURORA_VAR/repo"
+else
+    echo "[=] Repositório já existe em $AURORA_VAR/repo, atualizando..."
+    git -C "$AURORA_VAR/repo" pull
+fi
+
+# =========================
+# CRIAR CONFIGURAÇÃO PADRÃO
+# =========================
+echo "[+] Criando configuração padrão em $AURORA_ETC/aurora.conf..."
+
+cat > "$AURORA_ETC/aurora.conf" <<EOF
+# Aurora Package Manager Configuration
+
+# Repositórios (um único repo com subpastas)
+export AURORA_PATH="$AURORA_VAR/repo/core:$AURORA_VAR/repo/extra:$AURORA_VAR/repo/x11:$AURORA_VAR/repo/desktop"
+
+# Cache, logs e banco de dados
 export AURORA_CACHE="$AURORA_CACHE"
 export AURORA_LOG="$AURORA_LOG"
-export AURORA_DB="$AURORA_DB/db"
-export AURORA_GIT_SYNC=0. #Se quiser usar repo git tem que habilitar para 1.
-export AURORA_REPO_REMOTE="git@github.com:seu-usuario/aurora-repo.git"
+export AURORA_DB="$AURORA_VAR/db"
+
+# Git sync
+export AURORA_GIT_SYNC=1
+export AURORA_REPO_REMOTE="$AURORA_REPO_REMOTE"
 EOF
 
-# === Receita modelo ===
-echo "[Aurora bootstrap] Criando pacote de exemplo..."
-PKG="$AURORA_REPO/hello-aurora"
-mkdir -p "$PKG/patches"
-
-# version
-echo "1.0.0" > "$PKG/version"
-
-# sources (tarball válido do GNU hello)
-cat > "$PKG/sources" <<EOF
-https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz
-EOF
-
-# checksums (SHA256 do tarball acima)
-cat > "$PKG/checksums" <<EOF
-8e75cbf9e2a8b2e8f1d49ad3eae5d3a59fdf1f0bb9a1e31d42f6e26c6f2b5e4f
-EOF
-
-# depends
-cat > "$PKG/depends" <<EOF
-# Nenhuma dependência para o hello
-EOF
-
-# build
-cat > "$PKG/build" <<'EOF'
-#!/bin/sh -e
-pkgname=hello-aurora
-pkgver=$(cat version)
-
-./configure --prefix=/usr
-make -j"$(nproc)"
-make DESTDIR="$1" install
-EOF
-chmod +x "$PKG/build"
-
-# patch de exemplo
-cat > "$PKG/patches/fix-example.patch" <<EOF
---- a/src/hello.c
-+++ b/src/hello.c
-@@ -1,4 +1,4 @@
--printf("Hello, world!\n");
-+printf("Hello, Aurora!\n");
-EOF
-
-echo "[Aurora bootstrap] Concluído!"
+echo "[✓] Bootstrap concluído!"
 echo
-echo "========================================================"
-echo " Estrutura final do Aurora:"
-echo "========================================================"
-cat <<EOF
-/usr/bin/aurora                -> binário principal
-/etc/aurora.conf               -> configuração global
-
-/var/db/aurora/                -> diretórios de dados
-├── db/                        -> banco de dados de pacotes instalados
-│   └── <pacote>/              -> versão + lista de arquivos
-├── repo/                      -> repositórios de pacotes
-│   └── core/                  -> repositório 'core' (principal)
-│       └── hello-aurora/      -> exemplo de receita
-│           ├── version
-│           ├── sources
-│           ├── checksums
-│           ├── depends
-│           ├── build
-│           └── patches/...
-/var/cache/aurora/             -> cache de tarballs baixados
-/var/log/aurora/               -> logs de build/install
-/var/tmp/aurora/               -> diretório de builds temporários
-EOF
-echo "========================================================"
-echo
-echo "Use assim: . /etc/aurora.conf"
-echo "Teste com: aurora fetch hello-aurora && aurora build hello-aurora && aurora install hello-aurora"
+echo "Estrutura final esperada:"
+echo "
+/etc/aurora.conf
+/usr/local/bin/aurora
+/var/db/aurora/
+ ├── aurora/         -> código-fonte do gerenciador
+ ├── db/             -> banco de dados de pacotes
+ └── repo/           -> repositório Git clonado
+      ├── core/
+      ├── extra/
+      ├── x11/
+      └── desktop/
+/var/cache/aurora    -> cache de downloads
+/var/log/aurora      -> logs
+"
