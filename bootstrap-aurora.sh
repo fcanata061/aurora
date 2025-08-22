@@ -41,7 +41,8 @@ export AURORA_PATH="$AURORA_REPO"
 export AURORA_CACHE="$AURORA_CACHE"
 export AURORA_LOG="$AURORA_LOG"
 export AURORA_DB="$AURORA_DB/db"
-export AURORA_GIT_SYNC=0
+export AURORA_GIT_SYNC=0. #Se quiser usar repo git tem que habilitar para 1.
+export AURORA_REPO_REMOTE="git@github.com:seu-usuario/aurora-repo.git"
 EOF
 
 # === Receita modelo ===
